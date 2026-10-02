@@ -17,9 +17,9 @@ def load_data():
 df = load_data()
 
 st.title("AI-Powered Demand Forecasting & Inventory Decision Support")
-st.caption("Sprint 3 prototype • Corporación Favorita • Store 44")
+st.caption("Demand Forecasting & Inventory Decision Support • Corporación Favorita")
 
-st.sidebar.header("Prototype Controls")
+st.sidebar.header("Decision Controls")
 
 categories = sorted(df["Product_Category"].dropna().unique())
 selected_category = st.sidebar.selectbox(
