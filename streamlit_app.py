@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from prophet import Prophet
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
 
 st.set_page_config(
     page_title="Grocery Demand Forecasting",
@@ -25,8 +27,146 @@ def build_model():
         daily_seasonality=False,
         interval_width=0.80,
     )
+def create_rf_features(data):
+    rf_data = data.sort_values("Week_Start").copy()
 
+    rf_data["lag_1"] = rf_data["Weekly_Sales"].shift(1)
+    rf_data["lag_2"] = rf_data["Weekly_Sales"].shift(2)
+    rf_data["lag_4"] = rf_data["Weekly_Sales"].shift(4)
+    rf_data["lag_52"] = rf_data["Weekly_Sales"].shift(52)
 
+    rf_data["rolling_4"] = (
+        rf_data["Weekly_Sales"]
+        .shift(1)
+        .rolling(window=4)
+        .mean()
+    )
+
+    rf_data["week_of_year"] = (
+        rf_data["Week_Start"].dt.isocalendar().week.astype(int)
+    )
+    rf_data["month"] = rf_data["Week_Start"].dt.month
+
+    return rf_data
+
+def validate_random_forest(category_df, validation_weeks=4):
+    data = category_df.sort_values("Week_Start").copy()
+
+    train_data = data.iloc[:-validation_weeks].copy()
+    test_data = data.iloc[-validation_weeks:].copy()
+
+    rf_train = create_rf_features(train_data).dropna().copy()
+
+    feature_columns = [
+        "lag_1",
+        "lag_2",
+        "lag_4",
+        "lag_52",
+        "rolling_4",
+        "week_of_year",
+        "month",
+    ]
+
+    model = RandomForestRegressor(
+        n_estimators=200,
+        random_state=42
+    )
+
+    model.fit(
+        rf_train[feature_columns],
+        rf_train["Weekly_Sales"]
+    )
+
+    history = train_data["Weekly_Sales"].tolist()
+    predictions = []
+
+    for _, row in test_data.iterrows():
+        target_date = row["Week_Start"]
+
+        features = pd.DataFrame([{
+            "lag_1": history[-1],
+            "lag_2": history[-2],
+            "lag_4": history[-4],
+            "lag_52": history[-52],
+            "rolling_4": np.mean(history[-4:]),
+            "week_of_year": int(target_date.isocalendar().week),
+            "month": target_date.month,
+        }])
+
+        prediction = model.predict(features)[0]
+        prediction = max(0, prediction)
+
+        predictions.append(prediction)
+
+        # Use the predicted value for the next forecast step
+        history.append(prediction)
+
+    actual = test_data["Weekly_Sales"].values
+
+    mae = mean_absolute_error(actual, predictions)
+    mape = mean_absolute_percentage_error(actual, predictions) * 100
+
+    results = pd.DataFrame({
+        "Week_Start": test_data["Week_Start"].values,
+        "Actual": actual,
+        "Random_Forest": predictions,
+    })
+
+    return results, mae, mape
+def forecast_random_forest(category_df, periods=4):
+    data = category_df.sort_values("Week_Start").copy()
+
+    rf_data = create_rf_features(data).dropna().copy()
+
+    feature_columns = [
+        "lag_1",
+        "lag_2",
+        "lag_4",
+        "lag_52",
+        "rolling_4",
+        "week_of_year",
+        "month",
+    ]
+
+    model = RandomForestRegressor(
+        n_estimators=200,
+        random_state=42
+    )
+
+    model.fit(
+        rf_data[feature_columns],
+        rf_data["Weekly_Sales"]
+    )
+
+    history = data["Weekly_Sales"].tolist()
+    last_date = data["Week_Start"].max()
+
+    forecasts = []
+
+    for step in range(1, periods + 1):
+        target_date = last_date + pd.Timedelta(weeks=step)
+
+        features = pd.DataFrame([{
+            "lag_1": history[-1],
+            "lag_2": history[-2],
+            "lag_4": history[-4],
+            "lag_52": history[-52],
+            "rolling_4": np.mean(history[-4:]),
+            "week_of_year": int(target_date.isocalendar().week),
+            "month": target_date.month,
+        }])
+
+        prediction = model.predict(features)[0]
+        prediction = max(0, prediction)
+
+        forecasts.append({
+            "ds": target_date,
+            "yhat": prediction,
+        })
+
+        history.append(prediction)
+
+    return pd.DataFrame(forecasts)
 def estimate_promotion_uplift(category_df):
     """Estimate a simple historical promotion scenario uplift.
 
@@ -117,23 +257,43 @@ if nonzero.any():
     )
 else:
     mape = np.nan
+rf_validation_results, rf_mae, rf_mape = validate_random_forest(
+category_df,
+validation_weeks=4
+)
 
 # -----------------------------
 # 2) Future four-week forecast
 # -----------------------------
-final_model = build_model()
-final_model.fit(series)
-future_dates = final_model.make_future_dataframe(
-    periods=4,
-    freq="W-MON",
-    include_history=False,
-)
-future_forecast = final_model.predict(future_dates)[
-    ["ds", "yhat", "yhat_lower", "yhat_upper"]
-].copy()
+if not np.isnan(mape) and not np.isnan(rf_mape):
+    selected_forecast_model = (
+        "Random Forest" if rf_mape < mape else "Prophet"
+    )
+else:
+    selected_forecast_model = (
+        "Random Forest" if rf_mae < mae else "Prophet"
+    )
 
-for col in ["yhat", "yhat_lower", "yhat_upper"]:
-    future_forecast[col] = future_forecast[col].clip(lower=0)
+if selected_forecast_model == "Random Forest":
+    future_forecast = forecast_random_forest(
+        category_df,
+        periods=4
+    )
+else:
+    final_model = build_model()
+    final_model.fit(series)
+
+    future_dates = final_model.make_future_dataframe(
+        periods=4,
+        freq="W-MON",
+        include_history=False,
+    )
+
+    future_forecast = final_model.predict(future_dates)[
+        ["ds", "yhat"]
+    ].copy()
+
+future_forecast["yhat"] = future_forecast["yhat"].clip(lower=0)
 
 # -----------------------------
 # 3) Promotion scenario
@@ -191,7 +351,7 @@ elif current_inventory < adjusted_total + safety_stock:
 else:
     stock_risk = "Low"
 
-# -----------------------------
+# ------------------comparison_chart =-----------
 # Dashboard summary
 # -----------------------------
 summary1, summary2, summary3, summary4 = st.columns(4)
@@ -203,6 +363,28 @@ summary4.metric("Recommended order", f"{recommended_replenishment:,.0f}")
 # -----------------------------
 # Historical sales
 # -----------------------------
+st.subheader("Forecast Model Accuracy Comparison")
+
+accuracy_comparison = pd.DataFrame({
+    "Model": ["Prophet", "Random Forest"],
+    "MAPE (%)": [mape, rf_mape]
+}).set_index("Model")
+
+acc1, acc2 = st.columns(2)
+
+acc1.metric("Prophet MAPE", f"{mape:.1f}%")
+acc2.metric("Random Forest MAPE", f"{rf_mape:.1f}%")
+st.bar_chart(accuracy_comparison)
+
+st.caption(
+    "Lower MAPE indicates lower forecasting error and better validation performance."
+)
+
+st.success(
+    f"Selected model for the next 4-week forecast: {selected_forecast_model}"
+)
+
+
 st.subheader("Historical Weekly Sales")
 historical_chart = category_df.set_index("Week_Start")[["Weekly_Sales"]]
 st.line_chart(historical_chart)
@@ -210,20 +392,56 @@ st.line_chart(historical_chart)
 # -----------------------------
 # Forecast validation output
 # -----------------------------
-st.subheader("Forecast Validation — Last 4 Historical Weeks")
-validation_chart = validation_results.set_index("ds")[["Actual", "Predicted"]]
-st.line_chart(validation_chart)
+st.subheader("Forecast Model Comparison — Last 4 Historical Weeks")
 
-v1, v2 = st.columns(2)
-v1.metric("MAE", f"{mae:,.0f} units")
+st.markdown("#### Prophet Validation")
+
+prophet_chart = (
+validation_results[["ds", "Actual", "Predicted"]]
+.rename(columns={"Predicted": "Prophet"})
+.set_index("ds")[["Actual", "Prophet"]]
+)
+
+st.line_chart(prophet_chart)
+
+st.markdown("#### Random Forest Validation")
+
+random_forest_chart = (
+rf_validation_results[["Week_Start", "Actual", "Random_Forest"]]
+.set_index("Week_Start")[["Actual", "Random_Forest"]]
+)
+
+st.line_chart(random_forest_chart)
+
+m1, m2, m3, m4 = st.columns(4)
+
+m1.metric("Prophet MAE", f"{mae:,.0f} units")
+
 if np.isnan(mape):
-    v2.metric("MAPE", "Not available")
+    m2.metric("Prophet MAPE", "Not available")
 else:
-    v2.metric("MAPE", f"{mape:.1f}%")
+    m2.metric("Prophet MAPE", f"{mape:.1f}%")
+
+m3.metric("Random Forest MAE", f"{rf_mae:,.0f} units")
+
+if np.isnan(rf_mape):
+    m4.metric("Random Forest MAPE", "Not available")
+else:
+    m4.metric("Random Forest MAPE", f"{rf_mape:.1f}%")
+
+if not np.isnan(mape) and not np.isnan(rf_mape):
+    better_model = "Random Forest" if rf_mape < mape else "Prophet"
+else:
+    better_model = "Random Forest" if rf_mae < mae else "Prophet"
+
+st.success(
+    f"Better validation performance: {better_model}. "
+    "Lower MAE and MAPE indicate lower forecasting error."
+)
 
 st.caption(
-    "Validation approach: the final 4 historical weeks are held back, predicted using earlier data, "
-    "and then compared with their actual sales values."
+    "Both Prophet and Random Forest are tested on the same final 4 historical weeks "
+    "and compared against the actual recorded sales."
 )
 
 # -----------------------------
